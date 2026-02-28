@@ -8,7 +8,7 @@ from datetime import date, timedelta
 UPBIT_DAP_URL = "https://uptax-notice.s3.ap-northeast-2.amazonaws.com/daily-average-prices.xlsx"
 
 st.set_page_config(page_title="BTC 증여 최적 시점 분석", layout="wide")
-st.title("📊 BTC 증여 최적 시점 분석 대시보드")
+st.title("📊 BTC 증여 최적 시점 분석 대시보드 (세무 기준 VAL 포함)")
 
 @st.cache_data(ttl=3600)
 def load_btc_dap_from_sheetnames():
@@ -18,8 +18,8 @@ def load_btc_dap_from_sheetnames():
     xls = pd.ExcelFile(r.content)
 
     rows = []
-    # 시트명이 '2021-12-01' 같은 날짜 형태
     for sheet in xls.sheet_names:
+        # 시트명이 날짜 형태일 때만 사용
         try:
             d = pd.to_datetime(sheet, errors="raise").date()
         except Exception:
@@ -29,20 +29,14 @@ def load_btc_dap_from_sheetnames():
         if df is None or df.empty:
             continue
 
-        # 컬럼명 정리
         df.columns = [str(c).strip() for c in df.columns]
 
-        # 현재 확인된 구조: ['심볼', '일평균가']
-        if "심볼" not in df.columns or "일평균가" not in df.columns:
-            # 혹시 공백/철자 변형 대비
-            sym_col = next((c for c in df.columns if "심볼" in c), None)
-            price_col = next((c for c in df.columns if "평균" in c), None)
-            if not sym_col or not price_col:
-                continue
-        else:
-            sym_col, price_col = "심볼", "일평균가"
+        # 컬럼 찾기(확정 구조: 심볼 / 일평균가)
+        sym_col = "심볼" if "심볼" in df.columns else next((c for c in df.columns if "심볼" in c), None)
+        price_col = "일평균가" if "일평균가" in df.columns else next((c for c in df.columns if "평균" in c), None)
+        if not sym_col or not price_col:
+            continue
 
-        # BTC만 추출
         sub = df[[sym_col, price_col]].copy()
         sub[sym_col] = sub[sym_col].astype(str).str.upper().str.strip()
 
@@ -59,38 +53,60 @@ def load_btc_dap_from_sheetnames():
     out = pd.DataFrame(rows).sort_values("date").dropna()
     return out
 
-df = load_btc_dap_from_sheetnames()
+def compute_pre_and_val(df: pd.DataFrame, window_days: int = 30):
+    """
+    df: columns [date, dap] (date는 datetime64)
+    PRE(t) = mean(dap[t-window_days .. t])  -> 31일
+    VAL(t) = mean(dap[t-window_days .. t+window_days]) -> 61일 (세무 평가액)
+    """
+    df = df.sort_values("date").reset_index(drop=True).copy()
+    df["pre"] = df["dap"].rolling(window_days + 1).mean()
 
+    # VAL: centered rolling (61일). 양쪽 데이터가 있어야 값이 생김.
+    df["val"] = df["dap"].rolling(2 * window_days + 1, center=True).mean()
+    return df
+
+df = load_btc_dap_from_sheetnames()
 if df.empty:
     st.error("BTC 데이터를 찾지 못했습니다. 업비트 엑셀 구조/심볼명이 변경됐을 수 있습니다.")
     st.stop()
 
-# --- UI 설정
-window = st.slider("선행 평균 기간 (일)", 7, 60, 30)
-candidate_days = st.slider("최근 후보일 범위 (일)", 7, 60, 30)
+window = st.slider("평균 기간 window (±일)", 7, 60, 30)
+candidate_days = st.slider("최근 후보일 범위 (일)", 7, 90, 30)
 
-df["pre"] = df["dap"].rolling(window).mean()
+df2 = compute_pre_and_val(df, window_days=window)
 
 # --- 그래프
-st.subheader("📈 DAP vs PRE")
+st.subheader("📈 DAP / PRE / VAL(세무 기준)")
 fig, ax = plt.subplots(figsize=(12, 6))
-ax.plot(df["date"], df["dap"], label="DAP(일평균가액)", alpha=0.5)
-ax.plot(df["date"], df["pre"], label=f"PRE({window}일 평균)", linewidth=2)
+ax.plot(df2["date"], df2["dap"], label="DAP(일평균가액)", alpha=0.35)
+ax.plot(df2["date"], df2["pre"], label=f"PRE(선행 {window}일)", linewidth=2)
+ax.plot(df2["date"], df2["val"], label=f"VAL(세무: ±{window}일 평균)", linewidth=2)
 ax.legend()
 plt.xticks(rotation=45)
 st.pyplot(fig)
 
-# --- 후보일 TOP10
-st.subheader(f"🏆 최근 {candidate_days}일 후보 중 PRE 최저 TOP 10")
-recent_df = df.tail(candidate_days).copy().sort_values("pre")
-top10 = recent_df.head(10)
+# --- 후보일 구간
+recent = df2.tail(candidate_days).copy()
 
-for _, row in top10.iterrows():
+# PRE TOP10
+st.subheader(f"🏆 최근 {candidate_days}일 후보 중 PRE 최저 TOP 10 (실시간 의사결정용)")
+pre_top = recent.dropna(subset=["pre"]).sort_values("pre").head(10)
+for _, row in pre_top.iterrows():
     st.write(f"📅 {row['date'].date()} | PRE: {round(float(row['pre']), 2)} KRW")
 
+# VAL TOP10 (VAL은 양쪽 데이터가 필요하므로 결측 제거)
+st.subheader(f"🏆 최근 {candidate_days}일 후보 중 VAL 최저 TOP 10 (세무 평가액 기준)")
+val_top = recent.dropna(subset=["val"]).sort_values("val").head(10)
+if val_top.empty:
+    st.info("현재 선택한 후보 구간에서는 VAL이 계산되지 않습니다. (미래 ±window 데이터가 부족)")
+else:
+    for _, row in val_top.iterrows():
+        st.write(f"📅 {row['date'].date()} | VAL: {round(float(row['val']), 2)} KRW")
+
 # --- 추세(14일)
-st.subheader("📉 최근 14일 하락 추세(기울기)")
-recent_prices = df["dap"].tail(14).values
+st.subheader("📉 최근 14일 하락 추세(기울기, DAP 기준)")
+recent_prices = df2["dap"].tail(14).values
 if len(recent_prices) >= 14:
     x = np.arange(len(recent_prices))
     slope = np.polyfit(x, recent_prices, 1)[0]
