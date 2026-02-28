@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from datetime import datetime
 
 UPBIT_DAP_URL = "https://uptax-notice.s3.ap-northeast-2.amazonaws.com/daily-average-prices.xlsx"
 
@@ -16,23 +16,23 @@ def load_data():
     response = requests.get(UPBIT_DAP_URL)
     df = pd.read_excel(response.content)
 
-    # 컬럼 정리
-    df.columns = [str(c).strip().lower().replace(" ", "") for c in df.columns]
+    # 업비트 공시파일은 보통 이런 컬럼을 포함
+    # date / asset / daily_average_price 형식
+    df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # 날짜/자산/가격 컬럼 찾기
-    date_col = [c for c in df.columns if "date" in c or "일" in c][0]
-    asset_col = [c for c in df.columns if "asset" in c or "ticker" in c or "코인" in c][0]
-    price_col = [c for c in df.columns if "평균" in c or "price" in c][0]
+    # BTC만 필터
+    df = df[df.iloc[:,1].astype(str).str.upper() == "BTC"]
 
-    df = df[[date_col, asset_col, price_col]]
-    df.columns = ["date", "asset", "dap"]
+    # 날짜 + 가격 컬럼 고정 위치 사용
+    df = df[[df.columns[0], df.columns[2]]]
+    df.columns = ["date", "dap"]
 
-    df = df[df["asset"].str.upper() == "BTC"]
     df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
     df["dap"] = pd.to_numeric(df["dap"], errors="coerce")
 
-    return df.dropna()
+    df = df.sort_values("date").dropna()
+
+    return df
 
 df = load_data()
 
@@ -62,7 +62,6 @@ for _, row in top10.iterrows():
         f"📅 {row['date'].date()} | PRE: {round(row['pre'],2)} KRW"
     )
 
-# 추세 점수
 st.subheader("📉 최근 하락 추세 분석")
 
 recent_prices = df["dap"].tail(14).values
